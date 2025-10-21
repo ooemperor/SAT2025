@@ -1,8 +1,10 @@
 /**
  * File for the implementation of Server in the rsaproxy
+ *
  * @author: Michael Kaiser
  */
 package ch.rsaproxy;
+
 import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
 import javax.crypto.IllegalBlockSizeException;
@@ -14,7 +16,12 @@ import java.net.*;
 import java.security.*;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Base64;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 /**
  * class for the definition of a server
@@ -22,15 +29,13 @@ import java.util.Base64;
 public class Server {
 
     private ServerSocket clientServerSocket;
-    private ServerSocket serverServerSocket;
     private Socket serverSocket;
 
-    private String remoteAddress;
-    private int remotePort;
-    private int localClientPort;
-    private int localServerPort;
+    private final String remoteAddress;
+    private final int remotePort;
+    private final int localClientPort;
+    private final int localServerPort;
 
-    private DataInputStream clientIn;
     private DataOutputStream clientOut;
     private DataInputStream remoteIn;
     private DataOutputStream remoteOut;
@@ -38,11 +43,15 @@ public class Server {
     private KeyPair keyPair;
     private PublicKey remotePubKey;
 
+    private volatile boolean shutdown = false;
+    private final ExecutorService threadpool;
+
 
     /**
      * Constructor of the server
-     * @param remoteAddress the address on which the server should connect to
-     * @param remotePort the port used by the remote server
+     *
+     * @param remoteAddress   the address on which the server should connect to
+     * @param remotePort      the port used by the remote server
      * @param localClientPort the port for traffic to and from the local client
      * @param localServerPort the port used by this specific server to manage the server to server traffic.
      */
@@ -57,6 +66,8 @@ public class Server {
 
         this.localClientPort = localClientPort;
         this.localServerPort = localServerPort;
+
+        this.threadpool = Executors.newCachedThreadPool();
 
         this.setupKeys();
         this.invariant();
@@ -75,52 +86,53 @@ public class Server {
     /**
      * initialize the variables
      */
-    private void init(){
+    private void init() {
         this.invariant();
         Boolean serverSocketSuccess = this.setupServerSocket();
     }
 
     /**
      * Sets up all the ServerSockets
+     *
      * @return true if succesful
      */
-    private boolean setupServerSocket(){
+    private boolean setupServerSocket() {
         this.invariant();
-        System.out.println("Setting up ServerSockets");
+        this.log("Setting up ServerSockets");
+        ServerSocket serverServerSocket;
         try {
             this.clientServerSocket = new ServerSocket(this.localClientPort);
-            this.serverServerSocket = new ServerSocket(this.localServerPort);
-        }
-        catch (IOException e) {
-            System.out.println("Could not setup server socket " + e);
+            serverServerSocket = new ServerSocket(this.localServerPort);
+        } catch (IOException e) {
+            this.log("Could not setup server socket " + e);
             return false;
         }
 
         // try to connect to remote server
         try {
-            System.out.println("Trying to connect to remote server: " + this.remoteAddress + ":" + this.remotePort);
+            this.log("Trying to connect to remote server: " + this.remoteAddress + ":" + this.remotePort);
             this.serverSocket = new Socket(this.remoteAddress, this.remotePort);
             // if we get here, then connection is good and have to start the keyexchange.
             this.streamSetup();
             this.sendPubkey();
+            this.listenPubkey();
 
-        }
-        catch (IOException e) {
-            System.out.println("Could not setup server socket " + e);
+        } catch (IOException e) {
+            this.log("Could not setup server socket " + e);
         }
 
         try {
             if (this.serverSocket == null) {
-                System.out.println("Waiting for remote server to setup connection");
+                this.log("Waiting for remote server to setup connection");
                 // we don't have a connection to the remote server so we need to wait for it.
-                this.serverSocket = this.serverServerSocket.accept();
-                System.out.println("Connection established from remote server: " + this.remoteAddress + ":" + this.remotePort);
+                this.serverSocket = serverServerSocket.accept();
+                this.log("Connection established from remote server: " + this.remoteAddress + ":" + this.remotePort);
                 this.streamSetup();
                 this.listenPubkey();
+                this.sendPubkey();
             }
-        }
-        catch (IOException e) {
-            System.out.println("Could not accept server socket " + e);
+        } catch (IOException e) {
+            this.log("Could not accept server socket " + e);
             return false;
         }
         return true;
@@ -136,42 +148,45 @@ public class Server {
 
     /**
      * Send own public key to the remote server
+     *
      * @throws IOException when we cannot read what is coming from the remote server
      */
     private void sendPubkey() throws IOException {
 
-        System.out.println("Sending Pubkey");
+        this.log("Sending Pubkey");
         this.remoteOut.writeUTF("START PUBKEY");
         this.remoteOut.write(this.getPublicKey().getEncoded());
         this.remoteOut.writeUTF("END PUBKEY");
-        System.out.println("Finished sending Pubkey");
+        this.log("Finished sending Pubkey");
     }
 
     /**
      * listen for the remote server to transmit the pubkey
+     *
      * @throws IOException when error in decoding occurs
      */
     private void listenPubkey() throws IOException {
-        System.out.println("Listening for Pubkey");
-        String msg1 =  this.remoteIn.readUTF();
+        this.log("Listening for Pubkey");
+        String msg1 = this.remoteIn.readUTF();
         if (!msg1.equals("START PUBKEY")) {
-            System.out.println("Invalid first message while reading pubkey");
+            this.log("Invalid first message while reading pubkey");
             return;
         }
 
         // here comes the pubkey
-        byte[] msg2 =  this.remoteIn.readNBytes(294);
+        byte[] msg2 = this.remoteIn.readNBytes(294);
         this.remotePubKey = this.readPublicKey(msg2);
 
-        String msg3 =  this.remoteIn.readUTF();
+        String msg3 = this.remoteIn.readUTF();
         if (!msg3.equals("END PUBKEY")) {
-            System.out.println("Invalid last message while reading pubkey");
+            this.log("Invalid last message while reading pubkey");
         }
-        System.out.println("Finished reading Pubkey");
+        this.log("Finished reading Pubkey");
     }
 
     /**
      * Read a public key from a raw string
+     *
      * @param rawKey the raw string that represents the public key
      * @return the PublicKeyObject
      * @throws IOException when error occurs in decoder
@@ -181,126 +196,157 @@ public class Server {
             X509EncodedKeySpec spec = new X509EncodedKeySpec(rawKey);
             KeyFactory kf = KeyFactory.getInstance("RSA");
             return kf.generatePublic(spec);
-        }
-        catch (NoSuchAlgorithmException algo) {
-            System.out.println("RSA algorithm not found");
-        }
-        catch (InvalidKeySpecException key) {
-            System.out.println("Invalid key spec");
+        } catch (NoSuchAlgorithmException algo) {
+            this.log("RSA algorithm not found");
+        } catch (InvalidKeySpecException key) {
+            this.log("Invalid key spec");
         }
         return null;
     }
 
     /**
-     * close all the sockets that may be open
+     * Shutdown the server
      */
-    private void closeAll() {
-
-        try {
-            this.clientServerSocket.close();
-            this.serverServerSocket.close();
-        }
-        catch (IOException i){
-            System.out.println("Could not close sockets");
-        }
+    private void shutdown() {
+        this.log("Shutting down...");
+        this.threadpool.shutdown();
+        this.shutdown = true;
+        System.exit(0);
     }
 
 
     /**
      * Method to run the client
-     * TODO: receiving data from client and sending to other server is done
-     * TODO: need to implement receiving data from different stream at the same time
      */
-    public void run(){
-        System.out.println("Starting server on port " + this.localServerPort);
+    public void run() {
+        this.log("Starting server on port " + this.localServerPort);
         this.init();
-        System.out.println("Waiting for connections on port " + this.localClientPort);
+        this.log("Starting Client to Remote Server part of the server");
 
+        Future<?> clientToRemote = this.threadpool.submit(this::clientToRemoteServer);
+        Future<?> remoteToClient = this.threadpool.submit(this::remoteServerToClient);
+        while (!this.shutdown) {
+        } // we do nothing and loop
+    }
+
+    /**
+     * process the traffic from the client to the remote server
+     */
+    private void clientToRemoteServer() {
+        this.log("Waiting for connections on port " + this.localClientPort);
         try {
             Socket clientSocket = this.clientServerSocket.accept();
-            System.out.println("Accepted connection on port " + this.localClientPort);
-            this.clientIn = new DataInputStream(clientSocket.getInputStream());
+            this.log("Accepted connection on port " + this.localClientPort);
+            DataInputStream clientIn = new DataInputStream(clientSocket.getInputStream());
+            this.clientOut = new DataOutputStream(clientSocket.getOutputStream());
 
             String msg = "";
 
-            while (!msg.equals("kill")) {
+            while (!msg.equals("kill") && !this.shutdown) {
                 try {
-                    msg = this.clientIn.readUTF();
-                    System.out.println(msg);
+                    msg = clientIn.readUTF();
+                    this.log("Local Client: " + msg);
                     String encrypted = this.encrypt(msg);
+                    if (encrypted == null) {
+                        encrypted = "";
+                    }
                     this.remoteOut.writeUTF(encrypted);
-                }
-                catch (IOException e) {
-                    System.out.println("Could not read from the client" + e);
+                } catch (IOException e) {
+                    this.log("Could not read from the client " + e);
                 }
             }
 
             this.remoteOut.writeUTF("kill");
             // kill message received
-
-            this.clientIn.close();
-            this.clientOut.close();
             clientSocket.close();
-            this.closeAll();
+            this.shutdown();
 
+        } catch (IOException e) {
+            this.log("Could not accept connection on port " + this.localClientPort);
         }
-        catch (IOException e) {
-            System.out.println("Could not accept connection on port " + this.localClientPort);
+    }
+
+    /**
+     * process the traffic from the remote server to the client
+     */
+    private void remoteServerToClient() {
+        try {
+            String msg = "";
+
+            while (!msg.equals("kill") && !this.shutdown) {
+                try {
+                    msg = this.remoteIn.readUTF();
+                    this.log("Received encrypted message from remote server");
+                    String decrypted = this.decrypt(msg);
+                    this.log("Remote Server: " + decrypted);
+                    if (decrypted == null) {
+                        decrypted = "";
+                    }
+                    this.clientOut.writeUTF(decrypted);
+                } catch (IOException e) {
+                    this.log("Could not read from the remote Server" + e);
+                }
+            }
+            this.clientOut.writeUTF("kill");
+            // kill message received
+            this.shutdown();
+
+        } catch (IOException e) {
+            this.log("Could not accept connection on port " + this.localClientPort);
         }
     }
 
     // crypto helper methods
+
     /**
      * Setup public and private keypair
      */
-    private void setupKeys(){
-        System.out.println("Setting up RSA keys");
+    private void setupKeys() {
+        this.log("Setting up RSA keys");
         try {
             KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
             generator.initialize(2048);
             this.keyPair = generator.generateKeyPair();
-            System.out.println("Successfully setup RSA keys");
+            this.log("Successfully setup RSA keys");
 
-            System.out.println("Validating Pubkey Reader");
+            this.log("Validating Pubkey Reader");
             byte[] pub = this.getPublicKey().getEncoded();
             PublicKey pubkeyCand = this.readPublicKey(pub);
 
             if (!pubkeyCand.equals(this.keyPair.getPublic())) {
-                System.out.println("Invalid pubkey");
+                this.log("Invalid pubkey");
             }
-        }
-        catch (NoSuchAlgorithmException e) {
-            System.out.println("RSA algorithm not available");
-            System.out.println("Failed to setup RSA keys");
-        }
-        catch (IOException io) {
-            System.out.println("Failed to validate RSA keys");
+        } catch (NoSuchAlgorithmException e) {
+            this.log("RSA algorithm not available");
+            this.log("Failed to setup RSA keys");
+        } catch (IOException io) {
+            this.log("Failed to validate RSA keys");
         }
     }
 
     /**
      * Helper method to generate a RSA cipher
+     *
      * @return the RSA cipher
      */
     private Cipher getCipher() {
         try {
             return Cipher.getInstance("RSA");
-        }
-        catch (NoSuchAlgorithmException e) {
-            System.out.println("RSA algorithm not available");
-        }
-        catch (NoSuchPaddingException pad) {
-            System.out.println("Padding Exception: " + pad.getMessage());
+        } catch (NoSuchAlgorithmException e) {
+            this.log("RSA algorithm not available");
+        } catch (NoSuchPaddingException pad) {
+            this.log("Padding Exception: " + pad.getMessage());
         }
         return null;
     }
 
     /**
      * Helper method to encrypt a given text
+     *
      * @param plainText the string to be encrypted
      * @return the encrypted value
      */
-    private String encrypt(String plainText){
+    private String encrypt(String plainText) {
         assert this.remoteAddress != null && !this.remoteAddress.isEmpty();
         try {
             Cipher encryptCipher = this.getCipher();
@@ -311,25 +357,23 @@ public class Server {
             byte[] encryptedBytes = encryptCipher.doFinal(plainTextBytes);
 
             return Base64.getEncoder().encodeToString(encryptedBytes);
-        }
-        catch (InvalidKeyException key) {
-            System.out.println("Invalid key exception: " + key.getMessage());
-        }
-        catch (IllegalBlockSizeException block) {
-            System.out.println("Invlaid Blocksize for encryption: " + block.getMessage());
-        }
-        catch (BadPaddingException badpad){
-            System.out.println("Bad padding exception: " + badpad.getMessage());
+        } catch (InvalidKeyException key) {
+            this.log("Invalid key exception: " + key.getMessage());
+        } catch (IllegalBlockSizeException block) {
+            this.log("Invlaid Blocksize for encryption: " + block.getMessage());
+        } catch (BadPaddingException badpad) {
+            this.log("Bad padding exception: " + badpad.getMessage());
         }
         return null;
     }
 
     /**
      * helper method to decrypt the message received from the server
+     *
      * @param encryptedText the encrypted text from the other proxy
      * @return the decrypted clear text
      */
-    private String decrypt(String encryptedText){
+    private String decrypt(String encryptedText) {
         try {
             Cipher decryptCipher = this.getCipher();
             assert decryptCipher != null;
@@ -339,26 +383,44 @@ public class Server {
             byte[] decryptedBytes = decryptCipher.doFinal(encryptedTextBytes);
 
             return new String(decryptedBytes);
-        }
-        catch (InvalidKeyException key) {
-            System.out.println("Invalid key exception: " + key.getMessage());
-        }
-        catch (IllegalBlockSizeException block) {
-            System.out.println("Invlaid Blocksize for encryption: " + block.getMessage());
-        }
-        catch (BadPaddingException badpad){
-            System.out.println("Bad padding exception: " + badpad.getMessage());
+        } catch (InvalidKeyException key) {
+            this.log("Invalid key exception: " + key.getMessage());
+        } catch (IllegalBlockSizeException block) {
+            this.log("Invlaid Blocksize for encryption: " + block.getMessage());
+        } catch (BadPaddingException badpad) {
+            this.log("Bad padding exception: " + badpad.getMessage());
         }
         return null;
     }
 
+    /**
+     * Prints a log message
+     *
+     * @param message the log message to print
+     */
+    private void log(String message) {
+        System.out.println(this.timestamp() + ": " + message);
+    }
+
+    /**
+     * generate a formatted string of the current datetime
+     *
+     * @return the current timestamp used in logging
+     */
+    private String timestamp() {
+        LocalDateTime now = LocalDateTime.now();
+
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+        return now.format(formatter);
+    }
+
     // Getters and Setters
 
-    private PrivateKey getPrivateKey(){
+    private PrivateKey getPrivateKey() {
         return this.keyPair.getPrivate();
     }
 
-    private PublicKey getPublicKey(){
+    private PublicKey getPublicKey() {
         return this.keyPair.getPublic();
     }
 }
